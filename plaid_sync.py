@@ -17,10 +17,14 @@ Environment variables:
     WAVE_BUSINESS_ID          — your Wave business ID (run --dump-accounts to find it)
     PLAID_ACCESS_TOKENS       — JSON array (preferred) or legacy colon-delimited format
                                 JSON: [{"name":"Bluevine","token":"access-prod-xxx","wave_account":"My Checking (001)","type":"checking"}]
-                                Legacy: name:token:wave_account:type (comma-separated, still supported)
+                                Legacy: name:token:wave_account:type[:account_id] (comma-separated, still supported)
+                                Each entry must resolve to exactly ONE Plaid account — via the
+                                account_id field or the mask in the Wave account name, e.g.
+                                "My Checking (001)". Unresolvable entries are skipped; the script
+                                never syncs an entire Plaid item at once.
 """
 
-import os, sys, time, json, logging, argparse
+import os, sys, time, json, logging, argparse, re
 import httpx
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -199,6 +203,50 @@ def categorize(txn_name, accounts, keywords, is_expense):
     return None, None, False
 
 # ─── Plaid ────────────────────────────────────────────────────────────────────
+
+_plaid_accounts_cache = {}
+
+
+def get_plaid_accounts(access_token):
+    """Fetch (and cache) the list of accounts for a Plaid access token."""
+    if access_token not in _plaid_accounts_cache:
+        data = plaid_post("/accounts/get", {"access_token": access_token})
+        _plaid_accounts_cache[access_token] = data.get("accounts", [])
+    return _plaid_accounts_cache[access_token]
+
+
+def resolve_plaid_account_id(acct_cfg):
+    """Resolve a config entry to exactly one Plaid account_id.
+
+    Priority:
+      1. The explicit account_id field, verified against the token's accounts.
+      2. The mask in the Wave account name, e.g. "My Checking (001)".
+      3. The account itself when the Plaid item contains exactly one account.
+
+    Returns None when the entry cannot be resolved unambiguously. Callers must
+    treat None as "skip this entry" — never sync an entire Plaid item, because
+    an item can contain several accounts (which causes cross-account duplicates).
+    """
+    accts = get_plaid_accounts(acct_cfg["token"])
+    configured = (acct_cfg.get("account_id") or "").strip()
+    if configured:
+        if any(a.get("account_id") == configured for a in accts):
+            return configured
+        log.warning("Configured account_id was not found on its Plaid token — trying to resolve by mask")
+    m = re.search(r"\(([^)]+)\)", acct_cfg["wave_account"])
+    if m:
+        mask = m.group(1).strip()
+        exact = [a for a in accts if a.get("mask") == mask]
+        if len(exact) == 1:
+            return exact[0]["account_id"]
+        partial = [a for a in accts if (a.get("mask") or "").endswith(mask)]
+        if len(partial) == 1:
+            return partial[0]["account_id"]
+        return None
+    if len(accts) == 1:
+        return accts[0]["account_id"]
+    return None
+
 
 def fetch_plaid_transactions(access_token, days=30, account_ids=None):
     end = datetime.now().strftime("%Y-%m-%d")
@@ -396,8 +444,11 @@ def exchange_public_token(public_token):
 def reconcile(accounts_cfg, days):
     log.info(f"\n{'='*60}\nRECONCILIATION (last {days} days)\n{'='*60}")
     for acct_cfg in accounts_cfg:
-        txns = fetch_plaid_transactions(acct_cfg["token"], days,
-                                        [acct_cfg["account_id"]] if acct_cfg.get("account_id") else None)
+        account_id = resolve_plaid_account_id(acct_cfg)
+        if not account_id:
+            log.error(f"  {acct_cfg['name']}: could not resolve to a single Plaid account — skipped")
+            continue
+        txns = fetch_plaid_transactions(acct_cfg["token"], days, [account_id])
         plaid_out = sum(t["amount"] for t in txns if t["amount"] > 0 and not t["pending"])
         plaid_in = sum(abs(t["amount"]) for t in txns if t["amount"] < 0 and not t["pending"])
         log.info(f"\n  {acct_cfg['name']}:")
@@ -590,13 +641,21 @@ def main():
             errors += 1
             continue
 
+        account_id = resolve_plaid_account_id(acct_cfg)
+        if not account_id:
+            if args.quiet:
+                log.error(f"Account #{acct_idx}: could not resolve to a single Plaid account — skipped")
+            else:
+                log.error(f"Could not resolve '{acct_cfg['name']}' to a single Plaid account — skipped (refusing to sync the whole Plaid item)")
+            errors += 1
+            continue
+
         # In quiet mode, never log the bank/account/wallet name — use a positional alias.
         acct_label = f"Account #{acct_idx} ({acct_type})" if args.quiet else \
                      f"{acct_cfg['name']} → {wallet['name']} ({acct_type})"
         log.info(f"\n{'='*60}\n{acct_label}\n{'='*60}")
 
-        txns = fetch_plaid_transactions(acct_cfg["token"], args.days,
-                                        [acct_cfg["account_id"]] if acct_cfg.get("account_id") else None)
+        txns = fetch_plaid_transactions(acct_cfg["token"], args.days, [account_id])
         log.info(f"Fetched {len(txns)} transactions")
 
         for txn in txns:
