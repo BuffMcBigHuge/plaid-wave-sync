@@ -233,16 +233,17 @@ def resolve_plaid_account_id(acct_cfg):
         if any(a.get("account_id") == configured for a in accts):
             return configured
         log.warning("Configured account_id was not found on its Plaid token — trying to resolve by mask")
-    m = re.search(r"\(([^)]+)\)", acct_cfg["wave_account"])
-    if m:
-        mask = m.group(1).strip()
+    # Use the LAST parenthetical, e.g. "Chase (Main) (1234)" -> "1234".
+    groups = re.findall(r"\(([^)]*)\)", acct_cfg["wave_account"])
+    mask = groups[-1].strip() if groups else ""
+    if mask:
         exact = [a for a in accts if a.get("mask") == mask]
         if len(exact) == 1:
             return exact[0]["account_id"]
         partial = [a for a in accts if (a.get("mask") or "").endswith(mask)]
         if len(partial) == 1:
             return partial[0]["account_id"]
-        return None
+    # No usable mask match: a single-account item can only be that account.
     if len(accts) == 1:
         return accts[0]["account_id"]
     return None
