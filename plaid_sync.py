@@ -77,7 +77,7 @@ def parse_accounts():
     for entry in raw.split(","):
         parts = entry.strip().split(":")
         if len(parts) < 4:
-            log.warning(f"Skipping malformed account entry: {entry}")
+            log.warning(f"Skipping malformed account entry: {entry.strip().split(':')[0]}")
             continue
         name, token, rest = parts[0], parts[1], parts[2:]
         # Schema: name:token:wave_account:type[:account_id]. Wave name may contain
@@ -213,6 +213,12 @@ def get_plaid_accounts(access_token):
         data = plaid_post("/accounts/get", {"access_token": access_token})
         _plaid_accounts_cache[access_token] = data.get("accounts", [])
     return _plaid_accounts_cache[access_token]
+
+
+def get_plaid_account(acct_cfg, account_id):
+    """Return the Plaid account dict for a resolved account_id."""
+    return next((a for a in get_plaid_accounts(acct_cfg["token"])
+                 if a.get("account_id") == account_id), None)
 
 
 def resolve_plaid_account_id(acct_cfg):
@@ -449,6 +455,10 @@ def reconcile(accounts_cfg, days):
         if not account_id:
             log.error(f"  {acct_cfg['name']}: could not resolve to a single Plaid account — skipped")
             continue
+        plaid_acct = get_plaid_account(acct_cfg, account_id)
+        if plaid_acct and plaid_acct.get("type") == "investment":
+            log.info(f"  {acct_cfg['name']}: investment account — Plaid's transactions API doesn't cover it, skipped")
+            continue
         txns = fetch_plaid_transactions(acct_cfg["token"], days, [account_id])
         plaid_out = sum(t["amount"] for t in txns if t["amount"] > 0 and not t["pending"])
         plaid_in = sum(abs(t["amount"]) for t in txns if t["amount"] < 0 and not t["pending"])
@@ -649,6 +659,14 @@ def main():
             else:
                 log.error(f"Could not resolve '{acct_cfg['name']}' to a single Plaid account — skipped (refusing to sync the whole Plaid item)")
             errors += 1
+            continue
+
+        plaid_acct = get_plaid_account(acct_cfg, account_id)
+        if plaid_acct and plaid_acct.get("type") == "investment":
+            if args.quiet:
+                log.info(f"Account #{acct_idx}: investment account — not transaction-syncable, skipped")
+            else:
+                log.info(f"Skipping '{acct_cfg['name']}': '{plaid_acct['name']}' is an investment account — Plaid's transactions API doesn't cover it")
             continue
 
         # In quiet mode, never log the bank/account/wallet name — use a positional alias.
