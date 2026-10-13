@@ -400,7 +400,7 @@ def record_invoice_payment(invoice_id, amount, date, payment_account_id):
 def generate_reauth_link(access_token):
     data = plaid_post("/link/token/create", {
         "client_name": "plaid-wave-sync",
-        "country_codes": ["US"],
+        "country_codes": ["US", "CA"],
         "language": "en",
         "user": {"client_user_id": "user"},
         "access_token": access_token,
@@ -413,7 +413,7 @@ def generate_new_link():
     try:
         data = plaid_post("/link/token/create", {
             "client_name": "plaid-wave-sync",
-            "country_codes": ["US"],
+            "country_codes": ["US", "CA"],
             "language": "en",
             "user": {"client_user_id": "user"},
             "products": ["transactions"],
